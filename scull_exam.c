@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * scull_exam — three-backend char-device driver inspired by LDD3 scull/scullp/scullv.
+ * scull_exam — драйвер символьного устройства с тремя backend, вдохновлённый LDD3 scull/scullp/scullv.
  *
- * Families:
- *   scullp0..3  — quantums via __get_free_pages / free_pages
- *   scullv0..3  — quantums via vmalloc / vfree
- *   scullm0..3  — qset nodes from mempool (slab-backed), quantums page-based
+ * Семейства:
+ *   scullp0..3  — кванты через __get_free_pages / free_pages
+ *   scullv0..3  — кванты через vmalloc / vfree
+ *   scullm0..3  — узлы qset из mempool (поверх slab), кванты постраничные
  */
 
 #include <linux/module.h>
@@ -26,17 +26,17 @@
 #include "scull_exam.h"
 
 /* ================================================================
- * Module parameters
+ * Параметры модуля
  * ================================================================ */
 
-int scull_major;                   /* 0 => dynamic allocation        */
-int scull_minor;                   /* first minor number             */
-int scull_nr_devs   = SCULL_NR_DEVS; /* devices per family           */
-int scull_p_qset    = 1000;        /* default qset (pointers/node)   */
-int scullp_order    = 0;           /* page order for scullp          */
-int scullv_order    = 4;           /* page order for scullv          */
-int scullm_order    = 0;           /* page order for scullm quantums */
-int scullm_pool_min_nr = 32;       /* mempool minimum reserved objs  */
+int scull_major;                   /* 0 => динамическое выделение        */
+int scull_minor;                   /* первый minor-номер             */
+int scull_nr_devs   = SCULL_NR_DEVS; /* устройств в семействе           */
+int scull_p_qset    = 1000;        /* qset по умолчанию (указателей/узел)   */
+int scullp_order    = 0;           /* порядок страниц для scullp          */
+int scullv_order    = 4;           /* порядок страниц для scullv          */
+int scullm_order    = 0;           /* порядок страниц для квантов scullm */
+int scullm_pool_min_nr = 32;       /* минимальный резерв объектов mempool  */
 
 module_param(scull_major, int, S_IRUGO);
 module_param(scull_minor, int, S_IRUGO);
@@ -48,18 +48,18 @@ module_param(scullm_order, int, S_IRUGO);
 module_param(scullm_pool_min_nr, int, S_IRUGO);
 
 /* ================================================================
- * Globals
+ * Глобальные переменные
  * ================================================================ */
 
-static struct scull_dev *scull_devices;  /* array of SCULL_TOTAL devices */
-static struct class     *scull_class;    /* sysfs class for udev nodes   */
-static dev_t             scull_devno;    /* first dev_t (major+minor)    */
+static struct scull_dev *scull_devices;  /* массив из SCULL_TOTAL устройств */
+static struct class     *scull_class;    /* класс sysfs для узлов udev   */
+static dev_t             scull_devno;    /* первый dev_t (major+minor)    */
 
-/* device name prefixes, indexed by family */
+/* префиксы имён устройств, индексируются семейством */
 static const char * const family_name[] = { "scullp", "scullv", "scullm" };
 
 /* ================================================================
- * Backend helpers — pages (scullp)
+ * Хелперы backend — страницы (scullp)
  * ================================================================ */
 
 static void *scullp_alloc_quantum(struct scull_dev *dev)
@@ -86,7 +86,7 @@ static void scullp_free_qset(struct scull_dev *dev, struct scull_qset *qs)
 }
 
 /* ================================================================
- * Backend helpers — vmalloc (scullv)
+ * Хелперы backend — vmalloc (scullv)
  * ================================================================ */
 
 static void *scullv_alloc_quantum(struct scull_dev *dev)
@@ -113,12 +113,12 @@ static void scullv_free_qset(struct scull_dev *dev, struct scull_qset *qs)
 }
 
 /* ================================================================
- * Backend helpers — mempool (scullm)
+ * Хелперы backend — mempool (scullm)
  * ================================================================ */
 
 static void *scullm_alloc_quantum(struct scull_dev *dev)
 {
-	/* quantums stay page-based, same as scullp */
+	/* кванты остаются постраничными, как в scullp */
 	void *p = (void *)__get_free_pages(GFP_KERNEL, dev->order);
 	if (p)
 		memset(p, 0, PAGE_SIZE << dev->order);
@@ -132,7 +132,7 @@ static void scullm_free_quantum(struct scull_dev *dev, void *ptr)
 
 static struct scull_qset *scullm_alloc_qset(struct scull_dev *dev)
 {
-	/* allocate from the mempool (which draws from slab cache) */
+	/* выделение из mempool (который берёт память из slab-кэша) */
 	struct scull_qset *qs = mempool_alloc(dev->qset_pool, GFP_KERNEL);
 	if (qs)
 		memset(qs, 0, sizeof(*qs));
@@ -145,12 +145,12 @@ static void scullm_free_qset(struct scull_dev *dev, struct scull_qset *qs)
 }
 
 /* ================================================================
- * Shared core — scull_trim / scull_follow
+ * Общая часть — scull_trim / scull_follow
  * ================================================================ */
 
 /*
- * scull_trim — release all storage held by a device.
- * Caller must hold dev->lock.
+ * scull_trim — освободить всё хранилище, занятое устройством.
+ * Вызывающий код должен держать dev->lock.
  */
 static int scull_trim(struct scull_dev *dev)
 {
@@ -175,8 +175,8 @@ static int scull_trim(struct scull_dev *dev)
 }
 
 /*
- * scull_follow — walk (and optionally create) the qset linked list
- * to reach item number <n>.  Returns NULL on allocation failure.
+ * scull_follow — пройти (и при необходимости создать) связный список qset
+ * до элемента с номером <n>. Возвращает NULL при ошибке выделения памяти.
  */
 static struct scull_qset *scull_follow(struct scull_dev *dev, int n)
 {
@@ -201,7 +201,7 @@ static struct scull_qset *scull_follow(struct scull_dev *dev, int n)
 }
 
 /* ================================================================
- * File operations
+ * Операции файла
  * ================================================================ */
 
 static int scull_open(struct inode *inode, struct file *filp)
@@ -211,7 +211,7 @@ static int scull_open(struct inode *inode, struct file *filp)
 	dev = container_of(inode->i_cdev, struct scull_dev, cdev);
 	filp->private_data = dev;
 
-	/* if opened write-only, truncate (classic scull behaviour) */
+	/* если открыт только на запись — очищаем (классическое поведение scull) */
 	if ((filp->f_flags & O_ACCMODE) == O_WRONLY) {
 		mutex_lock(&dev->lock);
 		scull_trim(dev);
@@ -232,7 +232,7 @@ static ssize_t scull_read(struct file *filp, char __user *buf, size_t count,
 	struct scull_qset *dptr;
 	int quantum  = dev->quantum;
 	int qset     = dev->qset;
-	int itemsize = quantum * qset;  /* bytes per linked-list node */
+	int itemsize = quantum * qset;  /* байт на один узел связного списка */
 	int item, s_pos, q_pos, rest;
 	ssize_t retval = 0;
 
@@ -253,7 +253,7 @@ static ssize_t scull_read(struct file *filp, char __user *buf, size_t count,
 	if (!dptr || !dptr->data || !dptr->data[s_pos])
 		goto out;
 
-	/* read only up to end of this quantum */
+	/* читаем только до конца текущего кванта */
 	if (count > quantum - q_pos)
 		count = quantum - q_pos;
 
@@ -302,7 +302,7 @@ static ssize_t scull_write(struct file *filp, const char __user *buf,
 			goto out;
 	}
 
-	/* write only up to end of this quantum */
+	/* пишем только до конца текущего кванта */
 	if (count > quantum - q_pos)
 		count = quantum - q_pos;
 
@@ -355,7 +355,7 @@ static const struct file_operations scull_fops = {
 };
 
 /* ================================================================
- * Device setup / teardown helpers
+ * Хелперы инициализации / освобождения устройств
  * ================================================================ */
 
 static void scull_setup_cdev(struct scull_dev *dev, int index)
@@ -368,9 +368,9 @@ static void scull_setup_cdev(struct scull_dev *dev, int index)
 }
 
 /*
- * Initialise one scull_dev for a given family.
+ * Инициализировать один scull_dev для заданного семейства.
  *   family: 0 = scullp, 1 = scullv, 2 = scullm
- *   idx:    index within family (0..scull_nr_devs-1)
+ *   idx:    индекс внутри семейства (0..scull_nr_devs-1)
  */
 static int scull_init_dev(struct scull_dev *dev, int family, int idx)
 {
@@ -379,7 +379,7 @@ static int scull_init_dev(struct scull_dev *dev, int family, int idx)
 	dev->qset = scull_p_qset;
 
 	switch (family) {
-	case 0: /* scullp — page-based */
+	case 0: /* scullp — постраничный backend */
 		dev->order   = scullp_order;
 		dev->quantum = PAGE_SIZE << scullp_order;
 		dev->alloc_quantum = scullp_alloc_quantum;
@@ -388,7 +388,7 @@ static int scull_init_dev(struct scull_dev *dev, int family, int idx)
 		dev->free_qset     = scullp_free_qset;
 		break;
 
-	case 1: /* scullv — vmalloc-based */
+	case 1: /* scullv — backend на vmalloc */
 		dev->order   = scullv_order;
 		dev->quantum = PAGE_SIZE << scullv_order;
 		dev->alloc_quantum = scullv_alloc_quantum;
@@ -397,7 +397,7 @@ static int scull_init_dev(struct scull_dev *dev, int family, int idx)
 		dev->free_qset     = scullv_free_qset;
 		break;
 
-	case 2: /* scullm — mempool for qset nodes */
+	case 2: /* scullm — mempool для узлов qset */
 		dev->order   = scullm_order;
 		dev->quantum = PAGE_SIZE << scullm_order;
 
@@ -428,7 +428,7 @@ static int scull_init_dev(struct scull_dev *dev, int family, int idx)
 }
 
 /* ================================================================
- * Module init / exit
+ * Инициализация / выгрузка модуля
  * ================================================================ */
 
 static void scull_cleanup_module(void)
@@ -444,15 +444,15 @@ static void scull_cleanup_module(void)
 		family = i / scull_nr_devs;
 		idx    = i % scull_nr_devs;
 
-		/* remove sysfs device node */
+		/* удалить узел устройства из sysfs */
 		device_destroy(scull_class, scull_devno + i);
 
 		cdev_del(&dev->cdev);
 
-		/* free stored data */
+		/* освободить сохранённые данные */
 		scull_trim(dev);
 
-		/* destroy mempool resources if scullm */
+		/* удалить ресурсы mempool для scullm */
 		if (family == 2) {
 			if (dev->qset_pool)
 				mempool_destroy(dev->qset_pool);
@@ -476,7 +476,7 @@ static int __init scull_init_module(void)
 	int result, i, family, idx;
 	dev_t devno;
 
-	/* --- allocate device numbers --- */
+	/* --- выделение номеров устройств --- */
 	if (scull_major) {
 		scull_devno = MKDEV(scull_major, scull_minor);
 		result = register_chrdev_region(scull_devno, SCULL_TOTAL,
@@ -491,7 +491,7 @@ static int __init scull_init_module(void)
 		return result;
 	}
 
-	/* --- create sysfs class for udev --- */
+	/* --- создание класса sysfs для udev --- */
 	scull_class = class_create("scull_exam");
 	if (IS_ERR(scull_class)) {
 		result = PTR_ERR(scull_class);
@@ -500,7 +500,7 @@ static int __init scull_init_module(void)
 		return result;
 	}
 
-	/* --- allocate device array --- */
+	/* --- выделение массива устройств --- */
 	scull_devices = kzalloc(SCULL_TOTAL * sizeof(struct scull_dev),
 				GFP_KERNEL);
 	if (!scull_devices) {
@@ -508,7 +508,7 @@ static int __init scull_init_module(void)
 		goto fail;
 	}
 
-	/* --- initialise each device --- */
+	/* --- инициализация каждого устройства --- */
 	for (i = 0; i < SCULL_TOTAL; i++) {
 		family = i / scull_nr_devs;
 		idx    = i % scull_nr_devs;
