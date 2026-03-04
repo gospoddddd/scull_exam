@@ -1,4 +1,4 @@
-# Makefile for scull_exam kernel module
+# Makefile для модуля ядра scull_exam
 
 ifneq ($(KERNELRELEASE),)
   obj-m := scull_exam.o
