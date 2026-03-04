@@ -4,7 +4,6 @@
 
 #include <linux/cdev.h>
 #include <linux/mutex.h>
-#include <linux/mempool.h>
 
 /* ---------- классический узел связного списка scull (LDD3 §3) ---------- */
 struct scull_qset {
@@ -35,9 +34,6 @@ struct scull_dev {
 	struct scull_qset *(*alloc_qset)(struct scull_dev *);
 	void  (*free_qset)(struct scull_dev *, struct scull_qset *);
 
-	/* только для backend на mempool */
-	struct kmem_cache *qset_cache; /* slab-кэш для struct scull_qset          */
-	mempool_t         *qset_pool;  /* mempool поверх qset_cache               */
 };
 
 /* параметры модуля (объявлены в .c, вынесены extern здесь для ясности) */
@@ -47,11 +43,10 @@ extern int scull_nr_devs;
 extern int scull_p_qset;       /* переименовано, чтобы не конфликтовать с полем структуры */
 extern int scullp_order;
 extern int scullv_order;
-extern int scullm_order;
-extern int scullm_pool_min_nr;
+extern int scullc_quantum;
 
 #define SCULL_NR_DEVS   4      /* устройств в каждом семействе             */
-#define SCULL_FAMILIES  3      /* scullp, scullv, scullm                   */
+#define SCULL_FAMILIES  3      /* scullp, scullv, scullc                   */
 #define SCULL_TOTAL     (SCULL_NR_DEVS * SCULL_FAMILIES)
 
 #endif /* _SCULL_EXAM_H_ */

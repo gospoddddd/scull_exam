@@ -25,17 +25,15 @@ int scull_nr_devs   = SCULL_NR_DEVS; /* устройств в семействе
 int scull_p_qset    = 1000;        /* qset по умолчанию (указателей/узел)   */
 int scullp_order    = 0;           /* порядок страниц для scullp          */
 int scullv_order    = 4;           /* порядок страниц для scullv          */
-int scullm_order    = 0;           /* порядок страниц для квантов scullm */
-int scullm_pool_min_nr = 32;       /* резерв объектов mempool  */
+int scullc_quantum  = 4000;        /* размер кванта для scullc (slab-кэш) */
 
-module_param(scull_major, int, S_IRUGO); // S_IRUGO — разрешить чтение параметра через sysfs, но не разрешать запись
-module_param(scull_minor, int, S_IRUGO); 
-module_param(scull_nr_devs, int, S_IRUGO); // scull_nr_devs — число устройств в каждом семействе (по умолчанию 4)
-module_param(scull_p_qset, int, S_IRUGO); // scull_p_qset — число указателей на квант в одном узле связного списка (по умолчанию 1000)
-module_param(scullp_order, int, S_IRUGO); // scullp_order, scullv_order, scullm_order — порядок страниц для квантов в каждом backend (по умолчанию 0 для scullp и scullm, 4 для scullv)
+module_param(scull_major, int, S_IRUGO);
+module_param(scull_minor, int, S_IRUGO);
+module_param(scull_nr_devs, int, S_IRUGO);
+module_param(scull_p_qset, int, S_IRUGO);
+module_param(scullp_order, int, S_IRUGO);
 module_param(scullv_order, int, S_IRUGO);
-module_param(scullm_order, int, S_IRUGO);
-module_param(scullm_pool_min_nr, int, S_IRUGO); // scullm_pool_min_nr — минимальное число объектов в mempool для scullm (по умолчанию 32)
+module_param(scullc_quantum, int, S_IRUGO);
 
 /* ================================================================
  * Глобальные переменные
@@ -44,12 +42,13 @@ module_param(scullm_pool_min_nr, int, S_IRUGO); // scullm_pool_min_nr — мин
 static struct scull_dev *scull_devices;  /* массив из SCULL_TOTAL устройств */
 static struct class     *scull_class;    /* класс sysfs для узлов udev   */
 static dev_t             scull_devno;    /* первый dev_t (major+minor)    */
+static struct kmem_cache *scullc_cache;  /* общий slab-кэш квантов scullc */
 
 /* префиксы имён устройств, индексируются семейством */
-static const char * const family_name[] = { "scullp", "scullv", "scullm" };
+static const char * const family_name[] = { "scullp", "scullv", "scullc" };
 
 /* ================================================================
- * страницы (scullp)
+ * Хелперы backend — страницы (scullp)
  * ================================================================ */
 
 static void *scullp_alloc_quantum(struct scull_dev *dev) // Выделение кванта для scullp
@@ -103,35 +102,30 @@ static void scullv_free_qset(struct scull_dev *dev, struct scull_qset *qs)
 }
 
 /* ================================================================
- *  mempool (scullm)
+ * Хелперы backend — cache (scullc)
  * ================================================================ */
 
-static void *scullm_alloc_quantum(struct scull_dev *dev)
+static void *scullc_alloc_quantum(struct scull_dev *dev)
 {
-	/* кванты остаются постраничными, как в scullp */
-	void *p = (void *)__get_free_pages(GFP_KERNEL, dev->order); // __get_free_pages — выделяет непрерывный блок страниц, возвращая указатель на первую страницу. Первый аргумент — флаги аллокации, второй аргумент — порядок блока (количество страниц = 2^order).
+	void *p = kmem_cache_alloc(scullc_cache, GFP_KERNEL);
 	if (p)
-		memset(p, 0, PAGE_SIZE << dev->order);
+		memset(p, 0, dev->quantum);
 	return p;
 }
 
-static void scullm_free_quantum(struct scull_dev *dev, void *ptr)
+static void scullc_free_quantum(struct scull_dev *dev, void *ptr)
 {
-	free_pages((unsigned long)ptr, dev->order);
+	kmem_cache_free(scullc_cache, ptr);
 }
 
-static struct scull_qset *scullm_alloc_qset(struct scull_dev *dev)
+static struct scull_qset *scullc_alloc_qset(struct scull_dev *dev)
 {
-	/* выделение из mempool (который берёт память из slab-кэша) */
-	struct scull_qset *qs = mempool_alloc(dev->qset_pool, GFP_KERNEL); // mempool_alloc — выделяет qset узел из mempool. Первый аргумент — указатель на mempool, второй аргумент — флаги аллокации. Если mempool пуст, он может выделить память напрямую, используя функцию аллокации, предоставленную при создании mempool (в нашем случае, это будет выделение из slab-кэша). 	
-	if (qs)
-		memset(qs, 0, sizeof(*qs));
-	return qs;
+	return kzalloc(sizeof(struct scull_qset), GFP_KERNEL);
 }
 
-static void scullm_free_qset(struct scull_dev *dev, struct scull_qset *qs)
+static void scullc_free_qset(struct scull_dev *dev, struct scull_qset *qs)
 {
-	mempool_free(qs, dev->qset_pool);
+	kfree(qs);
 }
 
 /* ================================================================
@@ -140,6 +134,7 @@ static void scullm_free_qset(struct scull_dev *dev, struct scull_qset *qs)
 
 /*
  * scull_trim — освободить всё хранилище, занятое устройством.
+ * Вызывающий код должен держать dev->lock.
  */
 static int scull_trim(struct scull_dev *dev)
 {
@@ -201,7 +196,7 @@ static int scull_open(struct inode *inode, struct file *filp)
 	filp->private_data = dev; // Сохраняет указатель на структуру устройства в поле private_data структуры file, чтобы другие функции могли получить доступ к данным устройства.
 
 	/* если открыт только на запись — очищаем (классическое поведение scull) */
-	if ((filp->f_flags & O_ACCMODE) == O_WRONLY) { 
+	if ((filp->f_flags & O_ACCMODE) == O_WRONLY) {
 		mutex_lock(&dev->lock);
 		scull_trim(dev);
 		mutex_unlock(&dev->lock);
@@ -222,7 +217,7 @@ static ssize_t scull_read(struct file *filp, char __user *buf, size_t count,
 	int quantum  = dev->quantum;
 	int qset     = dev->qset;
 	int itemsize = quantum * qset;  /* байт на один узел связного списка */
-	int item, s_pos, q_pos, rest; // item — номер узла связного списка, s_pos — индекс кванта внутри узла, q_pos — смещение внутри кванта, rest — остаток от деления позиции на размер узла (используется для вычисления s_pos и q_pos)
+	int item, s_pos, q_pos, rest;
 	ssize_t retval = 0;
 
 	mutex_lock(&dev->lock); 
@@ -355,7 +350,7 @@ static void scull_setup_cdev(struct scull_dev *dev, int index)
 
 /*
  * Инициализировать один scull_dev для заданного семейства.
- *   family: 0 = scullp, 1 = scullv, 2 = scullm
+ *   family: 0 = scullp, 1 = scullv, 2 = scullc
  *   idx:    индекс внутри семейства (0..scull_nr_devs-1)
  */
 static int scull_init_dev(struct scull_dev *dev, int family, int idx)
@@ -383,31 +378,13 @@ static int scull_init_dev(struct scull_dev *dev, int family, int idx)
 		dev->free_qset     = scullv_free_qset;
 		break;
 
-	case 2: /* scullm — mempool для узлов qset */
-		dev->order   = scullm_order;
-		dev->quantum = PAGE_SIZE << scullm_order;
-
-		dev->qset_cache = kmem_cache_create( // Создаёт slab-кэш для struct scull_qset
-			"scullm_qset",
-			sizeof(struct scull_qset), 0,
-			SLAB_HWCACHE_ALIGN, NULL); 
-		if (!dev->qset_cache)
-			return -ENOMEM;
-
-		dev->qset_pool = mempool_create( // Создают mempool поверх этого slab cache.
-			scullm_pool_min_nr,
-			mempool_alloc_slab, mempool_free_slab, 
-			dev->qset_cache);
-		if (!dev->qset_pool) {
-			kmem_cache_destroy(dev->qset_cache);
-			dev->qset_cache = NULL;
-			return -ENOMEM;
-		}
-
-		dev->alloc_quantum = scullm_alloc_quantum;
-		dev->free_quantum  = scullm_free_quantum;
-		dev->alloc_qset    = scullm_alloc_qset;
-		dev->free_qset     = scullm_free_qset;
+	case 2: /* scullc — кванты из slab-кэша */
+		dev->order   = 0;
+		dev->quantum = scullc_quantum;
+		dev->alloc_quantum = scullc_alloc_quantum;
+		dev->free_quantum  = scullc_free_quantum;
+		dev->alloc_qset    = scullc_alloc_qset;
+		dev->free_qset     = scullc_free_qset;
 		break;
 	}
 	return 0;
@@ -419,16 +396,13 @@ static int scull_init_dev(struct scull_dev *dev, int family, int idx)
 
 static void scull_cleanup_module(void)
 {
-	int i, family, idx;
+	int i;
 
 	if (!scull_devices)
 		goto unregister;
 
 	for (i = 0; i < SCULL_TOTAL; i++) {
 		struct scull_dev *dev = &scull_devices[i];
-
-		family = i / scull_nr_devs;
-		idx    = i % scull_nr_devs;
 
 		/* удалить узел устройства из sysfs */
 		device_destroy(scull_class, scull_devno + i);
@@ -438,13 +412,7 @@ static void scull_cleanup_module(void)
 		/* освободить сохранённые данные */
 		scull_trim(dev);
 
-		/* удалить ресурсы mempool для scullm */
-		if (family == 2) {
-			if (dev->qset_pool)
-				mempool_destroy(dev->qset_pool);
-			if (dev->qset_cache)
-				kmem_cache_destroy(dev->qset_cache);
-		}
+		/* дополнительных ресурсов на уровне устройства нет */
 	}
 	kfree(scull_devices);
 
@@ -455,6 +423,10 @@ unregister:
 	}
 	if (scull_devno)
 		unregister_chrdev_region(scull_devno, SCULL_TOTAL);
+	if (scullc_cache) {
+		kmem_cache_destroy(scullc_cache);
+		scullc_cache = NULL;
+	}
 }
 
 static int __init scull_init_module(void)
@@ -477,13 +449,24 @@ static int __init scull_init_module(void)
 		return result;
 	}
 
+	/* --- создать общий slab-кэш квантов для scullc --- */
+	if (scullc_quantum <= 0) {
+		result = -EINVAL;
+		goto fail_unregister;
+	}
+	scullc_cache = kmem_cache_create("scullc", scullc_quantum, 0,
+					 SLAB_HWCACHE_ALIGN, NULL);
+	if (!scullc_cache) {
+		result = -ENOMEM;
+		goto fail_unregister;
+	}
+
 	/* --- создание класса sysfs для udev --- */
 	scull_class = class_create("scull_exam");
 	if (IS_ERR(scull_class)) {
 		result = PTR_ERR(scull_class);
 		scull_class = NULL;
-		unregister_chrdev_region(scull_devno, SCULL_TOTAL);
-		return result;
+		goto fail_unregister;
 	}
 
 	/* --- выделение массива устройств --- */
@@ -516,6 +499,14 @@ static int __init scull_init_module(void)
 
 fail:
 	scull_cleanup_module();
+	return result;
+
+fail_unregister:
+	if (scullc_cache) {
+		kmem_cache_destroy(scullc_cache);
+		scullc_cache = NULL;
+	}
+	unregister_chrdev_region(scull_devno, SCULL_TOTAL);
 	return result;
 }
 
